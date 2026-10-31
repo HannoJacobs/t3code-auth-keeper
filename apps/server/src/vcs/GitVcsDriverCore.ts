@@ -4218,6 +4218,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             isDefault: name === defaultBranch,
             worktreePath: worktreeMap.get(name) ?? null,
             ...(upstreamRef ? { upstreamRef } : {}),
+            ...(lastCommit > 0 ? { lastCommitAt: lastCommit } : {}),
           },
           lastCommit,
         });
@@ -4237,6 +4238,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           parsedRemoteRef.branchName === defaultBranch,
         worktreePath: null,
         ...(parsedRemoteRef ? { remoteName: parsedRemoteRef.remoteName } : {}),
+        ...(lastCommit > 0 ? { lastCommitAt: lastCommit } : {}),
       };
       remoteBranches.push({ ref: remoteBranch, lastCommit });
     }
