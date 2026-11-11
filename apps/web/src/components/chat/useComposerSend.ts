@@ -20,6 +20,7 @@ import {
   AuthOrchestrationOperateScope,
   DEFAULT_MODEL,
   type EnvironmentId,
+  type MessageId,
   type ModelSelection,
   type PreviewAnnotationPayload,
   type ScopedThreadRef,
@@ -370,6 +371,9 @@ export function useComposerSend(input: ComposerSendInput) {
   });
   const { sendInFlight: sendInFlightRef } = draftSendState(routeThreadKey);
   const composerSendGenerationRef = useRef(0);
+  // Queued messages still waiting on uploads, and the ones removed from the queue meanwhile.
+  const undispatchedQueuedSendsRef = useRef(new Map<MessageId, ChatMessage>());
+  const withdrawnQueuedSendsRef = useRef(new Set<MessageId>());
   const environmentUnavailableSendToastSlotRef = useRef(0);
   // A send awaits uploads before it declines, so it reads the approvals pending by then.
   const pendingApprovalsRef = useRef(pendingApprovals);
@@ -1158,6 +1162,9 @@ export function useComposerSend(input: ComposerSendInput) {
       optimisticBlobPreviews.release(optimisticMessage);
     }
     setOptimisticUserMessages((existing) => [...existing, optimisticMessage]);
+    if (shouldQueueBehindActiveRun) {
+      undispatchedQueuedSendsRef.current.set(messageIdForSend, optimisticMessage);
+    }
     setThreadError(threadIdForSend, null);
     if (expiredTerminalContextCount > 0) {
       const toastCopy = buildExpiredTerminalContextToastCopy(
@@ -1217,11 +1224,17 @@ export function useComposerSend(input: ComposerSendInput) {
       }
       return turnAttachments;
     });
-    if (failure === null && turnAttachmentsResult._tag === "Failure") {
+    undispatchedQueuedSendsRef.current.delete(messageIdForSend);
+    const withdrawn = withdrawnQueuedSendsRef.current.delete(messageIdForSend);
+    if (withdrawn) {
+      failure = null;
+      if (turnUsesAttachmentUploads) releaseDraftAttachments(composerAttachmentsSnapshot);
+    }
+    if (failure === null && !withdrawn && turnAttachmentsResult._tag === "Failure") {
       failure = turnAttachmentsResult;
     }
 
-    if (failure === null && compactBeforeSend) {
+    if (failure === null && !withdrawn && compactBeforeSend) {
       const compactResult = await startThreadTurn({
         environmentId,
         input: {
@@ -1245,7 +1258,7 @@ export function useComposerSend(input: ComposerSendInput) {
 
     let backgroundDraftOpened = false;
     let turnStartSucceeded = false;
-    if (failure === null && turnAttachmentsResult._tag === "Success") {
+    if (failure === null && !withdrawn && turnAttachmentsResult._tag === "Success") {
       const bootstrap =
         isLocalDraftThread || baseBranchForWorktree
           ? {
@@ -1556,8 +1569,18 @@ export function useComposerSend(input: ComposerSendInput) {
     }
   }
 
+  const withdrawQueuedSend = (messageId: MessageId) => {
+    const message = undispatchedQueuedSendsRef.current.get(messageId);
+    if (message === undefined) return;
+    undispatchedQueuedSendsRef.current.delete(messageId);
+    withdrawnQueuedSendsRef.current.add(messageId);
+    setOptimisticUserMessages((existing) => existing.filter((entry) => entry.id !== messageId));
+    optimisticBlobPreviews.release(message);
+  };
+
   return {
     onSend,
+    withdrawQueuedSend,
     onRetryFailedRun,
     retryingFailedRunId: retryingFailedRunId === failedRunId ? retryingFailedRunId : null,
   };
