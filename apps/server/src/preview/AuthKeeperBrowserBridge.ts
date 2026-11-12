@@ -23,6 +23,7 @@ export interface AuthKeeperBrowserIntegration {
 }
 
 const isBrowserProfile = Schema.is(BrowserProfileSchema);
+const managedProfiles = new Set(["auth-keeper-work", "auth-keeper-personal"]);
 
 const object = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object";
@@ -63,7 +64,20 @@ export async function startAuthKeeperBrowserBridge(
   const loaded: unknown = NodeModule.createRequire(import.meta.url)(manifest.module);
   if (!object(loaded) || loaded.protocol !== 1 || typeof loaded.start !== "function")
     throw new Error("auth_keeper_bridge_protocol_invalid");
-  const result: unknown = await loaded.start({ ...callbacks, manifestPath });
+  const scoped: AuthKeeperBrowserCallbacks = {
+    runtime: callbacks.runtime,
+    withPage: (profileId, run) => {
+      if (!managedProfiles.has(profileId))
+        return Promise.reject(new Error("auth_keeper_bridge_profile_invalid"));
+      return callbacks.withPage(profileId, run);
+    },
+    handoff: (input) => {
+      if (!managedProfiles.has(input.profileId) || new URL(input.url).protocol !== "https:")
+        return Promise.reject(new Error("auth_keeper_bridge_handoff_invalid"));
+      return callbacks.handoff(input);
+    },
+  };
+  const result: unknown = await loaded.start({ ...scoped, manifestPath });
   if (!object(result) || typeof result.close !== "function")
     throw new Error("auth_keeper_bridge_lifecycle_invalid");
   const close = result.close as () => Promise<void>;
@@ -71,7 +85,10 @@ export async function startAuthKeeperBrowserBridge(
     !Array.isArray(result.profiles) ||
     result.profiles.length > 16 ||
     !result.profiles.every(
-      (profile: unknown) => isBrowserProfile(profile) && profile.kind === "persistent",
+      (profile: unknown) =>
+        isBrowserProfile(profile) &&
+        profile.kind === "persistent" &&
+        managedProfiles.has(profile.id),
     ) ||
     new Set(result.profiles.map((profile: BrowserProfile) => profile.id)).size !==
       result.profiles.length

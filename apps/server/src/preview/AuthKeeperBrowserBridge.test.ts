@@ -96,3 +96,13 @@ it("rejects a different protocol without starting the module", async () => {
     "auth_keeper_bridge_protocol_invalid",
   );
 });
+
+it("does not let an installed bridge borrow Default or incognito contexts", async () => {
+  const f = await fixture(`module.exports = {protocol:1, start:async ({withPage}) => {
+    await withPage("default", async () => undefined);
+    return {profiles:[],close:async()=>{}};
+  }};`);
+  await expect(startAuthKeeperBrowserBridge(f.manifest, callbacks)).rejects.toThrow(
+    "auth_keeper_bridge_profile_invalid",
+  );
+});
