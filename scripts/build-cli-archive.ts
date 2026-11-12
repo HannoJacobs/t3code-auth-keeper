@@ -270,6 +270,19 @@ const bundleLinuxLibatomic = Effect.fn("bundleLinuxLibatomic")(function* (input:
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const bundled = yield* Config.String("T3CODE_CLI_LIBATOMIC_DIR").pipe(Config.option);
+  if (Option.isSome(bundled)) {
+    // Reuse an already released library with its exact license/source receipt on
+    // build hosts without dpkg. The operator records both hashes with the build.
+    const destination = path.join(input.contentDir, "lib");
+    yield* fs.makeDirectory(destination);
+    for (const name of ["libatomic.so.1", "libatomic.so.1.LICENSE"]) {
+      const source = path.join(bundled.value, name);
+      yield* requireInput(source, "The bundled libatomic directory needs its library and license.");
+      yield* fs.copyFile(source, path.join(destination, name));
+    }
+    return;
+  }
   const ldd = yield* spawner.string(ChildProcess.make("ldd", [input.executablePath]));
   const source = /libatomic\.so\.1 => (\/\S+)/.exec(ldd)?.[1];
   if (source === undefined) {

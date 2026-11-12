@@ -15,6 +15,7 @@ export interface AuthKeeperBrowserCallbacks {
     readonly url: string;
     readonly threadId: string;
   }) => Promise<{ readonly tabId: string }>;
+  readonly closeHandoff: (profileId: string) => Promise<void>;
 }
 
 export interface AuthKeeperBrowserIntegration {
@@ -75,6 +76,11 @@ export async function startAuthKeeperBrowserBridge(
       if (!managedProfiles.has(input.profileId) || new URL(input.url).protocol !== "https:")
         return Promise.reject(new Error("auth_keeper_bridge_handoff_invalid"));
       return callbacks.handoff(input);
+    },
+    closeHandoff: (profileId) => {
+      if (!managedProfiles.has(profileId))
+        return Promise.reject(new Error("auth_keeper_bridge_profile_invalid"));
+      return callbacks.closeHandoff(profileId);
     },
   };
   const result: unknown = await loaded.start({ ...scoped, manifestPath });

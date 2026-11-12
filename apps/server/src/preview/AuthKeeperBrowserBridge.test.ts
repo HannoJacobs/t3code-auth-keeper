@@ -37,6 +37,7 @@ const callbacks = {
   handoff: async () => {
     throw new Error("handoff not requested");
   },
+  closeHandoff: async () => {},
 };
 
 it("does nothing without explicit enrollment and rejects an unpinned or unsafe module before loading it", async () => {
