@@ -51,6 +51,10 @@ import { resolvePreviewViewport } from "@t3tools/shared/previewViewport";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import {
+  startAuthKeeperBrowserBridge,
+  type AuthKeeperBrowserIntegration,
+} from "./AuthKeeperBrowserBridge.ts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import { constVoid } from "effect/Function";
@@ -496,9 +500,21 @@ const make = Effect.gen(function* () {
 
   const closedPendingTabs = new Set<string>();
   const adoptedPages = new Map<string, { readonly page: Page; readonly openerTabId: string }>();
+  const recoveryTabs = new Map<string, string>();
+  const privateProfile = (profileId: string | undefined) =>
+    profileId !== undefined && [...recoveryTabs.values()].includes(profileId);
+  const refusePrivateRecovery = (profileId: string | undefined) => {
+    if (privateProfile(profileId))
+      throw new BrowserControlInterrupted({
+        message:
+          "Google sign-in is private and human-only. Auth Keeper must verify it before agent access resumes.",
+        reason: "humanControl",
+      });
+  };
   const closedSessions = new Set<string>();
   let hostConnectionId: string | null = null;
   let viewerResizeOrder = 0;
+  let authKeeperBridge: AuthKeeperBrowserIntegration | undefined;
 
   const contexts = new ServerBrowserContexts({
     profilesDir: NodePath.join(config.stateDir, "server-browser", "profiles"),
@@ -581,6 +597,12 @@ const make = Effect.gen(function* () {
   };
 
   const report = (tab: ServerTab, navStatus: PreviewNavStatus) => {
+    if (privateProfile(tab.profileId))
+      navStatus = {
+        _tag: "Success",
+        url: "about:blank",
+        title: "Private Google sign-in",
+      };
     void tab.cdp
       .send("Page.getNavigationHistory")
       .catch(() => null)
@@ -746,6 +768,7 @@ const make = Effect.gen(function* () {
     const key = tabKey(tab.threadId, tab.tabId);
     if (tabs.get(key) !== tab) return;
     tabs.delete(key);
+    recoveryTabs.delete(key);
     tab.closing = true;
     clearAbortedNavigation(tab);
     // A desktop page outlives the connection unless its session closed with it.
@@ -820,7 +843,9 @@ const make = Effect.gen(function* () {
     const adopted = adoptedPages.get(tabKey(snapshot.threadId, snapshot.tabId));
     adoptedPages.delete(tabKey(snapshot.threadId, snapshot.tabId));
     const desktop =
-      adopted === undefined && (await desktopRenders(snapshot))
+      adopted === undefined &&
+      !authKeeperBridge?.profiles.some((profile) => profile.id === snapshot.profileId) &&
+      (await desktopRenders(snapshot))
         ? await connectDesktop(snapshot)
         : null;
     if (desktop) opened.push(desktop.close);
@@ -1262,6 +1287,8 @@ const make = Effect.gen(function* () {
 
   const openDownload: ServerBrowser["Service"]["openDownload"] = (input) =>
     Effect.sync(() => {
+      if (privateProfile(tabs.get(tabKey(input.threadId, input.tabId))?.profileId))
+        return Option.none();
       const download = tabs
         .get(tabKey(input.threadId, input.tabId))
         ?.downloads.find((candidate) => candidate.id === input.downloadId);
@@ -1349,6 +1376,7 @@ const make = Effect.gen(function* () {
       return;
     }
     const url = popup.url();
+    const privatePopup = privateProfile(opener.profileId);
 
     const controller = [...opener.viewers].find(
       (viewer) => viewer.id === opener.control.controller,
@@ -1356,17 +1384,20 @@ const make = Effect.gen(function* () {
     await runPromise(
       openTab({
         threadId: opener.threadId,
-        ...(/^https?:/i.test(url) ? { url } : {}),
+        ...(!privatePopup && /^https?:/i.test(url) ? { url } : {}),
         runtime: "server",
         ...(opener.profileId === undefined ? {} : { profileId: opener.profileId }),
         ...(opener.control.agentId === null
           ? {}
           : { automationOwner: opener.control.agentId, reveal: false }),
-        beforePublish: (snapshot) =>
-          adoptedPages.set(tabKey(snapshot.threadId, snapshot.tabId), {
+        beforePublish: (snapshot) => {
+          const key = tabKey(snapshot.threadId, snapshot.tabId);
+          if (privatePopup) recoveryTabs.set(key, opener.profileId!);
+          adoptedPages.set(key, {
             page: popup,
             openerTabId: opener.tabId,
-          }),
+          });
+        },
       }),
     ).then(
       (tab) => {
@@ -1581,7 +1612,7 @@ const make = Effect.gen(function* () {
   );
 
   const profileStatus = () => {
-    const profiles = reportedProfiles?.profiles ?? BUILT_IN_BROWSER_PROFILES;
+    const profiles = profileCatalog();
     return {
       profiles: profiles.map((profile) => ({
         id: profile.id,
@@ -1592,9 +1623,15 @@ const make = Effect.gen(function* () {
     };
   };
 
+  const profileCatalog = () =>
+    resolveBrowserProfiles([
+      ...(reportedProfiles?.profiles ?? BUILT_IN_BROWSER_PROFILES),
+      ...(authKeeperBridge?.profiles ?? []),
+    ]);
+
   const resolveOpenProfile = (requested: string | undefined): string | undefined => {
     if (requested === undefined) return reportedProfiles?.defaultProfileId;
-    const profiles = reportedProfiles?.profiles ?? BUILT_IN_BROWSER_PROFILES;
+    const profiles = profileCatalog();
     const wanted = requested.toLowerCase();
     const match =
       findBrowserProfile(profiles, requested) ??
@@ -1623,6 +1660,17 @@ const make = Effect.gen(function* () {
         ...profileStatus(),
       };
     }
+    if (privateProfile(tab.profileId))
+      return {
+        available: true,
+        visible: isVisible(tab),
+        tabId: tab.tabId,
+        url: null,
+        title: "Private Google sign-in",
+        loading: false,
+        control: { owner: "human", ownedByCaller: false, generation: tab.control.generation },
+        ...profileStatus(),
+      };
     const url = ServerBrowserPage.withoutDataPayload(tab.page.url());
     const viewport = tab.desktop ? await layoutSize(tab) : tab.page.viewportSize();
     const status = {
@@ -1648,7 +1696,7 @@ const make = Effect.gen(function* () {
         .map((candidate) => ({
           tabId: candidate.tabId,
           url:
-            candidate.page.url() === "about:blank"
+            privateProfile(candidate.profileId) || candidate.page.url() === "about:blank"
               ? null
               : ServerBrowserPage.withoutDataPayload(candidate.page.url()),
           ...(candidate.openerTabId === undefined ? {} : { openerTabId: candidate.openerTabId }),
@@ -1954,6 +2002,7 @@ const make = Effect.gen(function* () {
         message: "No server preview tab is open for this thread. Call preview_open first.",
       });
     }
+    refusePrivateRecovery(tab.profileId);
     if (!READ_OPERATIONS.has(request.operation) && !tab.control.agentMayAct(request.agentSessionId))
       throw new BrowserControlInterrupted({
         message:
@@ -2039,6 +2088,7 @@ const make = Effect.gen(function* () {
             : undefined;
         const navigationTimeout = Math.min(request.timeoutMs, NAVIGATION_TIMEOUT_MS);
         const profileId = existing ? undefined : resolveOpenProfile(open.profileId);
+        refusePrivateRecovery(existing?.profileId ?? profileId);
         if (!existing) closeIdleAgentTabs();
         const tab =
           existing ??
@@ -2834,8 +2884,67 @@ const make = Effect.gen(function* () {
     Effect.forever,
     Effect.forkScoped,
   );
+  const ownerEnvironment = yield* HostProcess.Environment;
+  authKeeperBridge = yield* Effect.tryPromise({
+    try: () =>
+      startAuthKeeperBrowserBridge(ownerEnvironment.T3CODE_AUTH_KEEPER_BRIDGE, {
+        runtime: { kind: "server", pid: process.pid, stateDir: config.stateDir },
+        withPage: async (profileId, run) => {
+          const context = await contexts.contextFor(profileId);
+          const page = await context.newPage();
+          try {
+            const cdp = await context.newCDPSession(page);
+            await presentAsChrome(cdp, host);
+            return await run(page);
+          } finally {
+            await page.close().catch(constVoid);
+          }
+        },
+        handoff: async ({ profileId, url, threadId }) => {
+          const context = await contexts.contextFor(profileId);
+          const page = await context.newPage();
+          try {
+            const tab = await runPromise(
+              openTab({
+                threadId: ThreadId.make(threadId),
+                profileId,
+                url,
+                runtime: "server",
+                reveal: true,
+                beforePublish: (snapshot) => {
+                  const key = tabKey(snapshot.threadId, snapshot.tabId);
+                  recoveryTabs.set(key, profileId);
+                  adoptedPages.set(key, { page, openerTabId: snapshot.tabId });
+                },
+              }),
+            );
+            return { tabId: tab.tabId };
+          } catch (cause) {
+            await page.close().catch(constVoid);
+            throw cause;
+          }
+        },
+        closeHandoff: async (profileId) => {
+          for (const [key, ownedProfile] of recoveryTabs) {
+            if (ownedProfile !== profileId) continue;
+            const tab = tabs.get(key);
+            if (tab) {
+              await runPromise(manager.close({ threadId: tab.threadId, tabId: tab.tabId }));
+              dropTab(tab, false);
+            }
+            recoveryTabs.delete(key);
+          }
+        },
+      }),
+    catch: () => "auth_keeper_browser_bridge_unavailable" as const,
+  }).pipe(
+    Effect.catch(() =>
+      Effect.logWarning("Auth Keeper browser integration unavailable").pipe(Effect.as(undefined)),
+    ),
+  );
   yield* Effect.addFinalizer(() =>
     Effect.promise(async () => {
+      await authKeeperBridge?.close();
       await contexts.close();
     }),
   );

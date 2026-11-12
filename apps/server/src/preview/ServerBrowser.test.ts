@@ -39,6 +39,23 @@ import * as Manager from "./Manager.ts";
 import * as PreviewAgentActivity from "./PreviewAgentActivity.ts";
 import * as ServerBrowser from "./ServerBrowser.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
+import type { AuthKeeperBrowserCallbacks } from "./AuthKeeperBrowserBridge.ts";
+
+let keeperEnabled = false;
+let keeperCallbacks: AuthKeeperBrowserCallbacks | undefined;
+vi.mock("./AuthKeeperBrowserBridge.ts", () => ({
+  startAuthKeeperBrowserBridge: async (
+    _manifest: unknown,
+    callbacks: AuthKeeperBrowserCallbacks,
+  ) => {
+    if (!keeperEnabled) return undefined;
+    keeperCallbacks = callbacks;
+    return {
+      profiles: [{ id: "auth-keeper-work", name: "Healthbridge Google", kind: "persistent" }],
+      close: async () => {},
+    };
+  },
+}));
 
 vi.mock("./ServerBrowserContexts.ts", () => ({
   presentAsChrome: async () => {},
@@ -473,6 +490,8 @@ const openDesktopViewer = Effect.gen(function* () {
 });
 
 beforeEach(() => {
+  keeperEnabled = false;
+  keeperCallbacks = undefined;
   contexts.length = 0;
   encoderStreams.length = 0;
   contextRequests.length = 0;
@@ -495,6 +514,75 @@ beforeEach(() => {
   releasedDesktopTabs.length = 0;
   desktopConnections.length = 0;
 });
+
+it.live(
+  "human Google recovery hides all agent content channels until protected recheck closes it",
+  () => {
+    keeperEnabled = true;
+    return Effect.gen(function* () {
+      const { browser, broker, tabId: normalTab } = yield* ready;
+      const opened = yield* Effect.promise(() =>
+        keeperCallbacks!.handoff({
+          profileId: "auth-keeper-work",
+          threadId: scope.thread.threadId,
+          url: "https://accounts.google.com/signin?fixture-secret=123456",
+        }),
+      );
+      const tabId = PreviewTabId.make(opened.tabId);
+      const status = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        tabId,
+        operation: "status",
+        input: {},
+      });
+      expect(status.title).toBe("Private Google sign-in");
+      expect(status.url).toBeNull();
+      expect(JSON.stringify(status)).not.toContain("123456");
+      for (const operation of ["snapshot", "evaluate", "waitFor", "recordingStart"] as const) {
+        const error = yield* broker
+          .invoke<void>({
+            scope,
+            tabId,
+            operation,
+            input: { expression: "document.body.innerText" },
+          })
+          .pipe(Effect.flip);
+        expect(error.message).toContain("human controls");
+      }
+      const deniedOpen = yield* broker
+        .invoke<void>({
+          scope,
+          operation: "open",
+          input: { profileId: "auth-keeper-work", reuseExistingTab: false },
+        })
+        .pipe(Effect.flip);
+      expect(deniedOpen.message).toContain("human controls");
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      yield* viewer.input({ type: "takeControl" });
+      yield* viewer.input({ type: "key", action: "down", key: "1", code: "Digit1", text: "1" });
+      expect(
+        contexts[1]!.sessions.some((session) =>
+          session.send.mock.calls.some(([method]) => method === "Input.dispatchKeyEvent"),
+        ),
+      ).toBe(true);
+      const normal = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        tabId: normalTab,
+        operation: "status",
+        input: {},
+      });
+      expect(normal.title).not.toBe("Private Google sign-in");
+      yield* Effect.promise(() => keeperCallbacks!.closeHandoff("auth-keeper-work"));
+      expect(contexts[1]!.page.close).toHaveBeenCalled();
+      const next = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "open",
+        input: { profileId: "auth-keeper-work", reuseExistingTab: false, show: false },
+      });
+      expect(next.available).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(layer));
+  },
+);
 
 it.live("tells the desktop once per thread when its agent turns start and end", () =>
   Effect.gen(function* () {
